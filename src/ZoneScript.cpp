@@ -14,30 +14,36 @@
 #include <map>
 #include <vector>
 #include <format>
+#include <random>
+
+// Структура одного активного ивента
+struct ActiveEvent {
+    uint32 zoneId;
+    uint32 areaId;
+    std::string zoneName;
+    std::string areaName;
+};
 
 struct Config
 {
     bool   enabled            = true;
     uint32 kill_goal          = 50;
     uint32 kill_points        = 10;
-    uint32 announcement_delay = 60000; // Храним в мс
+    uint32 announcement_delay = 60000;
     uint32 event_delay        = 1800000; 
     uint32 event_lasts        = 600000;  
-	
-	std::unordered_map<uint32, std::vector<uint32>> ids;
+    uint32 max_simultaneous   = 10; // Сколько зон запускать одновременно
 
-    uint32 current_zone;
-    uint32 current_area;
-    std::string current_zone_name;
-    std::string current_area_name;
-
+    std::unordered_map<uint32, std::vector<uint32>> ids;
+    
+    // Список всех запущенных ивентов
+    std::vector<ActiveEvent> active_events;
     bool active = false;
 
     std::vector<ObjectGuid> area_players;
     std::vector<ObjectGuid> zone_players;
     std::map<ObjectGuid, uint32> points;
 
-    // Таймеры в миллисекундах для OnUpdate
     int32 timer_event = 1800000;
     int32 timer_announce = 60000;
 };
@@ -47,93 +53,45 @@ Config config;
 class ZoneConfig : public WorldScript
 {
 public:
-    ZoneConfig() : WorldScript("pvp_zones_Config", {
-        WORLDHOOK_ON_STARTUP
-    }) {}
+    ZoneConfig() : WorldScript("pvp_zones_Config", { WORLDHOOK_ON_STARTUP }) {}
 
     void OnStartup() override
     {
-		config.enabled            = sConfigMgr->GetOption<bool>("pvp_zones.Enable", true);
-		config.kill_goal          = sConfigMgr->GetOption<uint32>("pvp_zones.KillGoal", 50); // По умолчанию 50 киллов
-		config.kill_points        = sConfigMgr->GetOption<uint32>("pvp_zones.KillPoints", 10);
-		
-		config.announcement_delay = sConfigMgr->GetOption<uint32>("pvp_zones.AnnouncementDelay", 60) * 1000;
+        config.enabled            = sConfigMgr->GetOption<bool>("pvp_zones.Enable", true);
+        config.kill_goal          = sConfigMgr->GetOption<uint32>("pvp_zones.KillGoal", 50);
+        config.kill_points        = sConfigMgr->GetOption<uint32>("pvp_zones.KillPoints", 10);
+        config.max_simultaneous   = sConfigMgr->GetOption<uint32>("pvp_zones.MaxZones", 10);
+        
+        config.announcement_delay = sConfigMgr->GetOption<uint32>("pvp_zones.AnnouncementDelay", 60) * 1000;
         config.event_delay        = sConfigMgr->GetOption<uint32>("pvp_zones.EventDelay", 1800) * 1000;
         config.event_lasts        = sConfigMgr->GetOption<uint32>("pvp_zones.EventLasts", 600) * 1000;
-		
-		config.timer_event = config.event_delay; // Первый ивент через delay мс
+        
+        config.timer_event = config.event_delay;
         config.timer_announce = config.announcement_delay;
-		
-		std::set<uint32> levelingZones = {
-			// --- Classic (30-60) ---
-			10,   // Arathi Highlands
-			33,   // Stranglethorn Vale
-			405,  // Desolace
-			36,   // Alterac Mountains
-			3,    // Badlands
-			8,    // Swamp of Sorrows
-			141,  // Dustwallow Marsh
-			440,  // Tanaris
-			357,  // Feralas
-			45,   // Hinterlands
-			51,   // Searing Gorge
-			4,    // Blasted Lands
-			490,  // Un'Goro Crater
-			361,  // Felwood
-			46,   // Burning Steppes
-			139,  // Western Plaguelands
-			28,   // Eastern Plaguelands
-			618,  // Winterspring
-			1377, // Silithus
 
-			// --- Outland (58-70) ---
-			3483, // Hellfire Peninsula
-			3521, // Zangarmarsh
-			3519, // Terokkar Forest
-			3518, // Nagrand
-			3522, // Blade's Edge Mountains
-			3520, // Shadowmoon Valley
-			3523, // Netherstorm
+        std::set<uint32> levelingZones = {
+            10, 33, 405, 36, 3, 8, 141, 440, 357, 45, 51, 4, 490, 361, 46, 139, 28, 618, 1377,
+            3483, 3521, 3519, 3518, 3522, 3520, 3523,
+            3537, 495, 394, 65, 66, 3711, 67, 210, 4197, 4395
+        };
+        
+        config.ids.clear();
+        uint32 totalSubAreas = 0;
+        for (uint32 i = 0; i < sAreaTableStore.GetNumRows(); ++i)
+        {
+            AreaTableEntry const* area = sAreaTableStore.LookupEntry(i);
+            if (!area) continue;
+            uint32 parentId = (area->zone != 0) ? area->zone : area->ID;
 
-			// --- Northrend (68-80) ---
-			3537, // Borean Tundra
-			495,  // Howling Fjord
-			394,  // Grizzly Hills
-			65,   // Dragonblight
-			66,   // Zul'Drak
-			3711, // Sholazar Basin
-			67,   // The Storm Peaks
-			210,  // Icecrown
-			4197, // Wintergrasp
-			4395  // Crystalsong Forest (но мы отфильтруем Даларан ниже)
-		};
-		
-		config.ids.clear();
-		
-		uint32 totalSubAreas = 0;
-		// Проходим по всем записям таблицы зон (AreaTable)
-		for (uint32 i = 0; i < sAreaTableStore.GetNumRows(); ++i)
-		{
-			AreaTableEntry const* area = sAreaTableStore.LookupEntry(i);
-			if (!area)
-				continue;
-
-			// В твоей структуре DBCStructure.h это поле называется 'zone'
-			uint32 parentId = (area->zone != 0) ? area->zone : area->ID;
-
-			// Теперь эта строка сработает без ошибок:
-			if (levelingZones.find(parentId) != levelingZones.end())
-			{
-				if (area->flags & AREA_FLAG_SANCTUARY) continue; // Пропускаем Даларан, Шаттрат
-                if (area->flags & AREA_FLAG_CAPITAL)   continue; // Пропускаем столицы
-
-				config.ids[parentId].push_back(area->ID);
-				totalSubAreas++;
-			}
-		}
-
-		LOG_INFO("module", "[pvp_zones] Loaded {} main zones and {} sub-areas.", (uint32)config.ids.size(), totalSubAreas);
-	}
+            if (levelingZones.find(parentId) != levelingZones.end())
+            {
+                if (area->IsSanctuary() || (area->flags & AREA_FLAG_CAPITAL)) continue;
+                config.ids[parentId].push_back(area->ID);
+                totalSubAreas++;
+            }
+        }
+        LOG_INFO("module", "[pvp_zones] Loaded {} main zones and {} sub-areas.", (uint32)config.ids.size(), totalSubAreas);
+    }
 };
 
 class ZoneLogicScript : public PlayerScript
@@ -141,110 +99,106 @@ class ZoneLogicScript : public PlayerScript
 public:
     ZoneLogicScript() : PlayerScript("pvp_zones_PlayerScript") {}
 
-    // Метод получения имени игрока (универсальный способ)
-    static std::string GetNameByGUID(ObjectGuid guid)
-    {
-        if (Player* p = ObjectAccessor::FindConnectedPlayer(guid))
-            return p->GetName();
+    // Помощник: проверка, активна ли данная зона/область сейчас
+    static const ActiveEvent* GetActiveEventByZone(uint32 zoneId) {
+        for (auto const& ev : config.active_events)
+            if (ev.zoneId == zoneId) return &ev;
+        return nullptr;
+    }
 
-        QueryResult result = CharacterDatabase.Query("SELECT name FROM characters WHERE guid = {}", guid.GetCounter());
-        if (result)
-            return (*result)[0].Get<std::string>();
-
-        return "Unknown";
+    static const ActiveEvent* GetActiveEventByArea(uint32 areaId) {
+        for (auto const& ev : config.active_events)
+            if (ev.areaId == areaId) return &ev;
+        return nullptr;
     }
 
     void OnPlayerUpdateArea(Player* player, uint32, uint32 newArea) override
     {
         if (!config.active) return;
         ObjectGuid guid = player->GetGUID();
-        if (config.current_area == newArea)
-        {
-            if (std::find(config.area_players.begin(), config.area_players.end(), guid) == config.area_players.end())
-            {
-                ChatHandler(player->GetSession()).SendSysMessage("You have entered the Oceanic War blood zone!");
+
+        if (GetActiveEventByArea(newArea)) {
+            if (std::find(config.area_players.begin(), config.area_players.end(), guid) == config.area_players.end()) {
+                ChatHandler(player->GetSession()).SendSysMessage("You have entered a blood zone (Double Points)!");
                 config.area_players.push_back(guid);
             }
-        }
-        else
+        } else {
             config.area_players.erase(std::remove(config.area_players.begin(), config.area_players.end(), guid), config.area_players.end());
+        }
     }
 
-     void OnPlayerUpdateZone(Player* player, uint32 newZone, uint32) override
+    void OnPlayerUpdateZone(Player* player, uint32 newZone, uint32) override
     {
         if (!config.active) return;
         ObjectGuid guid = player->GetGUID();
-        if (config.current_zone == newZone)
-        {
-            if (std::find(config.zone_players.begin(), config.zone_players.end(), guid) == config.zone_players.end())
-            {
-                ChatHandler(player->GetSession()).SendSysMessage("You have entered the Oceanic War zone!");
+
+        if (GetActiveEventByZone(newZone)) {
+            if (std::find(config.zone_players.begin(), config.zone_players.end(), guid) == config.zone_players.end()) {
+                ChatHandler(player->GetSession()).SendSysMessage("You have entered a PvP War Zone!");
                 config.zone_players.push_back(guid);
                 player->SetPvP(true);
             }
-        }
-        else
+        } else {
             config.zone_players.erase(std::remove(config.zone_players.begin(), config.zone_players.end(), guid), config.zone_players.end());
-    }
-
-    void PostLeaderBoard(ChatHandler* handler)
-    {
-        handler->SendGlobalSysMessage("[PvP Zones Leaderboard]");
-        if (config.points.empty()) return;
-
-        for (auto const& [guid, score] : config.points)
-        {
-            std::string name = GetNameByGUID(guid);
-			handler->PSendSysMessage(std::format("{}: {}", name, score));
         }
-    }
-
-    static void PostAnnouncement(ChatHandler* handler)
-    {
-        if (!config.active) return;
-		handler->PSendSysMessage(std::format("[pvp_zones] Is currently active in: {} - {}", config.current_zone_name, config.current_area_name));
     }
 
     static void CreateEvent(ChatHandler* handler)
     {
         if (config.active) return;
 
-        config.active = true;
-        config.timer_event = config.event_lasts; // Теперь таймер отсчитывает длительность
-        config.timer_announce = config.announcement_delay;
-        
-        config.kill_goal = sConfigMgr->GetOption<uint32>("pvp_zones.KillGoal", 50);
+        config.active_events.clear();
         config.points.clear();
         config.area_players.clear();
         config.zone_players.clear();
 
-        auto map_it = std::begin(config.ids);
-        std::advance(map_it, rand() % config.ids.size());
-        auto area_it = std::begin(map_it->second);
-        std::advance(area_it, rand() % map_it->second.size());
+        // Собираем все доступные материнские зоны
+        std::vector<uint32> parentKeys;
+        for (auto const& [id, subs] : config.ids) parentKeys.push_back(id);
 
-        config.current_zone = map_it->first;
-        config.current_area = *area_it;
+        // Перемешиваем список, чтобы выбрать случайные
+        std::shuffle(parentKeys.begin(), parentKeys.end(), std::default_random_engine(std::random_device{}()));
 
-        if (AreaTableEntry const* entry = sAreaTableStore.LookupEntry(config.current_area))
-            config.current_area_name = entry->area_name[handler->GetSessionDbcLocale()];
-        if (AreaTableEntry const* z_entry = sAreaTableStore.LookupEntry(config.current_zone))
-            config.current_zone_name = z_entry->area_name[handler->GetSessionDbcLocale()];
+        // Берем до N зон (по умолчанию 10)
+        uint32 toStart = std::min((uint32)parentKeys.size(), config.max_simultaneous);
 
-        handler->SendGlobalSysMessage(std::format("[pvp_zones] A new zone has been declared: {} - {}", config.current_zone_name, config.current_area_name).c_str());
+        for (uint32 i = 0; i < toStart; ++i) {
+            uint32 zId = parentKeys[i];
+            uint32 aId = config.ids[zId][rand() % config.ids[zId].size()];
 
+            ActiveEvent ev;
+            ev.zoneId = zId;
+            ev.areaId = aId;
+
+            if (AreaTableEntry const* ze = sAreaTableStore.LookupEntry(zId))
+                ev.zoneName = ze->area_name[handler->GetSessionDbcLocale()];
+            if (AreaTableEntry const* ae = sAreaTableStore.LookupEntry(aId))
+                ev.areaName = ae->area_name[handler->GetSessionDbcLocale()];
+
+            config.active_events.push_back(ev);
+        }
+
+        config.active = true;
+        config.timer_event = config.event_lasts;
+        config.timer_announce = config.announcement_delay;
+
+        handler->SendGlobalSysMessage(std::format("[pvp_zones] WAR DECLARED! {} zones are now active PvP areas!", toStart).c_str());
+        
+        // Массовый анонс всех зон
+        for (auto const& ev : config.active_events) {
+            handler->SendGlobalSysMessage(std::format(" > {} ({})", ev.zoneName, ev.areaName).c_str());
+        }
+
+        // Включаем PvP тем, кто уже там
         WorldSessionMgr::SessionMap const& m_sessions = sWorldSessionMgr->GetAllSessions();
-        for (auto const& pair : m_sessions)
-        {
-            if (Player* p = pair.second->GetPlayer())
-            {
-                if (p->GetZoneId() == config.current_zone)
-                {
+        for (auto const& pair : m_sessions) {
+            if (Player* p = pair.second->GetPlayer()) {
+                if (GetActiveEventByZone(p->GetZoneId())) {
                     p->SetPvP(true);
                     config.zone_players.push_back(p->GetGUID());
+                    if (GetActiveEventByArea(p->GetAreaId()))
+                        config.area_players.push_back(p->GetGUID());
                 }
-                if (p->GetAreaId() == config.current_area)
-                    config.area_players.push_back(p->GetGUID());
             }
         }
     }
@@ -252,36 +206,87 @@ public:
     static void EndEvent(ChatHandler* handler)
     {
         if (!config.active) return;
-
         config.active = false;
-        config.timer_event = config.event_delay; // Теперь таймер отсчитывает задержку до следующего
-        
-        handler->SendGlobalSysMessage("[pvp_zones] The event has ended.");
-        config.points.clear();
-        config.area_players.clear();
-        config.zone_players.clear();
+        config.timer_event = config.event_delay;
+        config.active_events.clear();
+        handler->SendGlobalSysMessage("[pvp_zones] All events have ended.");
     }
 
     void OnPlayerPVPKill(Player* winner, Player* loser) override
     {
         if (!config.active) return;
-        if (winner->GetZoneId() == config.current_zone)
-        {
+
+        // Если убийца в одной из активных зон
+        if (GetActiveEventByZone(winner->GetZoneId())) {
             uint32 reward = config.kill_points;
-            if (winner->GetAreaId() == config.current_area) reward *= 2;
+            if (GetActiveEventByArea(winner->GetAreaId())) reward *= 2;
+
             config.points[winner->GetGUID()] += reward;
-            ChatHandler(winner->GetSession()).PSendSysMessage(std::format("[pvp_zones] Gained {} points!", reward));
-            
-            if (config.kill_goal > 0)
+            ChatHandler(winner->GetSession()).SendSysMessage(std::format("[pvp_zones] +{} points!", reward));
+        }
+    }
+	
+	// --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ДЛЯ КОМАНД ---
+
+    // Показывает текущие активные зоны (10 штук)
+    static bool HandleViewCommand(ChatHandler* handler)
+    {
+        if (!config.active || config.active_events.empty())
+        {
+            handler->SendSysMessage("|cffFF0000[PvP Zones]|r В данный момент нет активных событий.");
+            return true;
+        }
+
+        handler->SendSysMessage("|cffFFFF00--- Список АКТИВНЫХ PvP зон ---|r");
+        uint32 count = 0;
+        for (auto const& ev : config.active_events)
+        {
+            count++;
+            handler->SendSysMessage(std::format("|cff00FF00{}. {} ({})|r", count, ev.zoneName, ev.areaName).c_str());
+        }
+        
+        handler->SendSysMessage(std::format("Цель убийств на зону: |cffFFFFFF{}|r", config.kill_goal).c_str());
+        return true;
+    }
+
+    // Показывает ВООБЩЕ ВСЕ зоны, которые загружены в систему (из OnStartup)
+    static bool HandleListCommand(ChatHandler* handler)
+    {
+        if (config.ids.empty())
+        {
+            handler->SendSysMessage("Список всех зон пуст. Проверьте OnStartup.");
+            return true;
+        }
+
+        handler->SendSysMessage("|cffFFFF00--- База данных всех доступных PvP локаций ---|r");
+
+        for (auto const& [parentId, subAreas] : config.ids)
+        {
+            std::string parentName = "Unknown";
+            if (AreaTableEntry const* pEntry = sAreaTableStore.LookupEntry(parentId))
+                parentName = pEntry->area_name[handler->GetSessionDbcLocale()];
+
+            handler->SendSysMessage(std::format("|cff00FF00Зона: {} ({})|r - Подзон: {}", parentId, parentName, (uint32)subAreas.size()).c_str());
+
+            std::string areaList = "  |cff888888Подзоны: ";
+            for (size_t i = 0; i < subAreas.size(); ++i)
             {
-                config.kill_goal--;
-                if (config.kill_goal == 0)
+                std::string aName = "Unknown";
+                if (AreaTableEntry const* aEntry = sAreaTableStore.LookupEntry(subAreas[i]))
+                    aName = aEntry->area_name[handler->GetSessionDbcLocale()];
+
+                areaList += std::format("{} ({})", aName, subAreas[i]);
+                if (i < subAreas.size() - 1) areaList += ", ";
+
+                if (areaList.length() > 240)
                 {
-                    ChatHandler h(winner->GetSession());
-                    EndEvent(&h);
+                    handler->SendSysMessage(areaList);
+                    areaList = "  ";
                 }
             }
+            if (areaList.length() > 5) handler->SendSysMessage(areaList);
         }
+        return true;
     }
 };
 
@@ -290,49 +295,35 @@ class ZoneWorld : public WorldScript
 public:
     ZoneWorld() : WorldScript("pvp_zones_World") {}
 
-	void OnUpdate(uint32 diff) override
+    void OnUpdate(uint32 diff) override
     {
         if (!config.enabled) return;
 
-        // 1. Управление таймером ивента (старт/стоп)
         config.timer_event -= diff;
-        if (config.timer_event <= 0)
-        {
-            Player* p = GetAnyPlayer();
-            if (p)
-            {
+        if (config.timer_event <= 0) {
+            if (Player* p = GetAnyPlayer()) {
                 ChatHandler h(p->GetSession());
-                if (!config.active)
-                    ZoneLogicScript::CreateEvent(&h);
-                else
-                    ZoneLogicScript::EndEvent(&h);
-            }
-            else
-            {
-                // Если игроков нет, просто сбросим таймер, чтобы не спамить проверку
-                config.timer_event = 5000; 
+                if (!config.active) ZoneLogicScript::CreateEvent(&h);
+                else ZoneLogicScript::EndEvent(&h);
+            } else {
+                config.timer_event = 5000;
             }
         }
 
-        // 2. Управление анонсами (только во время ивента)
-        if (config.active)
-        {
+        if (config.active) {
             config.timer_announce -= diff;
-            if (config.timer_announce <= 0)
-            {
+            if (config.timer_announce <= 0) {
                 config.timer_announce = config.announcement_delay;
-                if (Player* p = GetAnyPlayer())
-                {
+                if (Player* p = GetAnyPlayer()) {
                     ChatHandler h(p->GetSession());
-                    ZoneLogicScript::PostAnnouncement(&h);
+                    for (auto const& ev : config.active_events)
+                        h.PSendSysMessage(std::format("[pvp_zones] Active: {} ({})", ev.zoneName, ev.areaName));
                 }
             }
         }
     }
 
-private:
-    Player* GetAnyPlayer()
-    {
+    Player* GetAnyPlayer() {
         WorldSessionMgr::SessionMap const& sessions = sWorldSessionMgr->GetAllSessions();
         for (auto const& pair : sessions)
             if (pair.second && pair.second->GetPlayer() && pair.second->GetPlayer()->IsInWorld())
@@ -351,66 +342,43 @@ public:
     {
         static ChatCommandTable commandTable =
         {
-            { "pvpz.create", HandleCreateCommand, SEC_GAMEMASTER, Console::No },
-            { "pvpz.end",    HandleEndCommand,    SEC_GAMEMASTER, Console::No },
-			{ "pvpz.list",   HandleListCommand,   SEC_GAMEMASTER, Console::No }
+            { "create", HandleCreateCommand, SEC_GAMEMASTER, Console::No },
+            { "end",    HandleEndCommand,    SEC_GAMEMASTER, Console::No },
+            { "list",   HandleListCommand,   SEC_GAMEMASTER, Console::No },
+            { "view",   HandleViewCommand,   SEC_GAMEMASTER, Console::No }
         };
-        return commandTable;
+
+        // Регистрация подкоманд для .pvpz (например: .pvpz view)
+        static ChatCommandTable pvpzCommandTable =
+        {
+            { "pvpz", commandTable }
+        };
+
+        return pvpzCommandTable;
     }
 
-    static bool HandleCreateCommand(ChatHandler* handler) { ZoneLogicScript::CreateEvent(handler); return true; }
-    static bool HandleEndCommand(ChatHandler* handler) { ZoneLogicScript::EndEvent(handler); return true; }
-	static bool HandleListCommand(ChatHandler* handler)
-	{
-		if (config.ids.empty())
-		{
-			handler->SendSysMessage("Список PvP зон пуст. Проверьте логи OnStartup.");
-			return true;
-		}
+    // Врапперы (обертки) для связи команд с логикой
+    static bool HandleCreateCommand(ChatHandler* handler) 
+    { 
+        ZoneLogicScript::CreateEvent(handler); 
+        return true; 
+    }
 
-		handler->SendSysMessage("|cffFFFF00--- Список зарегистрированных PvP локаций ---|r");
+    static bool HandleEndCommand(ChatHandler* handler) 
+    { 
+        ZoneLogicScript::EndEvent(handler); 
+        return true; 
+    }
 
-		uint32 totalZones = 0;
-		for (auto const& [parentId, subAreas] : config.ids)
-		{
-			// Получаем имя главной зоны
-			std::string parentName = "Неизвестная зона";
-			if (AreaTableEntry const* pEntry = sAreaTableStore.LookupEntry(parentId))
-				parentName = pEntry->area_name[handler->GetSessionDbcLocale()];
+    static bool HandleListCommand(ChatHandler* handler) 
+    { 
+        return ZoneLogicScript::HandleListCommand(handler); 
+    }
 
-			// Формируем заголовок группы
-			handler->SendSysMessage(std::format("|cff00FF00Зона: {} ({}) - Подзон: {}|r", parentId, parentName, (uint32)subAreas.size()));
-
-			// Собираем имена подзон в одну строку, чтобы не спамить в чат по одной строчке
-			std::string areaList = "  |cff888888Области: ";
-			for (size_t i = 0; i < subAreas.size(); ++i)
-			{
-				std::string aName = "Unknown";
-				if (AreaTableEntry const* aEntry = sAreaTableStore.LookupEntry(subAreas[i]))
-					aName = aEntry->area_name[handler->GetSessionDbcLocale()];
-
-				areaList += std::format("{} ({})", aName, subAreas[i]);
-
-				if (i < subAreas.size() - 1)
-					areaList += ", ";
-
-				// Если строка слишком длинная (более 250 символов), отправляем её и начинаем новую
-				if (areaList.length() > 250)
-				{
-					handler->SendSysMessage(areaList.c_str());
-					areaList = "  ";
-				}
-			}
-
-			if (areaList.length() > 2)
-				handler->SendSysMessage(areaList.c_str());
-			
-			totalZones++;
-		}
-
-		handler->PSendSysMessage(std::format("|cffFFFF00Всего активных материнских зон: {}", totalZones));
-		return true;
-	}
+    static bool HandleViewCommand(ChatHandler* handler) 
+    { 
+        return ZoneLogicScript::HandleViewCommand(handler); 
+    }
 };
 
 void Addpvp_zonesScripts()
